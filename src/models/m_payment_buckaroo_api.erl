@@ -1,0 +1,819 @@
+%% @copyright 2020-2026 Driebit BV
+%% @doc API interface and (push) state handling for Buckaroo PSP
+%% @end
+
+%% Copyright 2020-2026 Driebit BV
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+
+-module(m_payment_buckaroo_api).
+
+-export([
+    create/2,
+    webhook_data/2,
+    transaction_status/2,
+
+    is_test/1,
+    api_key/1,
+    webhook_url/2,
+    payment_url/1,
+
+    is_valid_authorization_header/2,
+    update_payment_status/4
+    ]).
+
+-export([
+    api_test/1,
+    invoice_nr/2,
+    test/1
+]).
+
+-include_lib("zotonic_core/include/zotonic.hrl").
+-include_lib("zotonic_core/include/zotonic_release.hrl").
+-include_lib("zotonic_mod_payment/include/payment.hrl").
+
+-define(BUCKAROO_API_URL, "https://checkout.buckaroo.nl/").
+-define(BUCKAROO_TEST_API_URL, "https://testcheckout.buckaroo.nl/").
+
+
+-define(TIMEOUT_REQUEST, 10000).
+-define(TIMEOUT_CONNECT, 5000).
+
+-type payment_id() :: pos_integer().
+-type payment() :: map().
+-type payment_result() :: {ok, #payment_psp_handler{}} | {error, term()}.
+-type api_method() :: get | post.
+-type http_method() :: api_method() | 'GET' | 'POST' | binary().
+-type api_result() :: {ok, binary() | map()} | {error, term()}.
+
+-spec test(Context) -> Result
+    when
+        Context :: z:context(),
+        Result :: {ok, binary()} | term().
+test(Context) ->
+    PaymentRequest = #payment_request{
+        key = undefined,
+        user_id = undefined,
+        amount = 1.0,
+        currency = <<"EUR">>,
+        language = z_context:language(Context),
+        description_html = <<"Test">>,
+        is_qargs = false,
+        is_recurring_start = false,
+        extra_props = [
+            {email, <<"marc@worrell.nl">>},
+            {name_surname, <<"Pietersen">>}
+        ]
+    },
+    case z_notifier:first(PaymentRequest, Context) of
+        #payment_request_redirect{ redirect_uri = RedirectUri } ->
+            {ok, RedirectUri};
+        Other ->
+            Other
+    end.
+
+
+-spec api_test(Context) -> Result
+    when
+        Context :: z:context(),
+        Result :: api_result().
+api_test(Context) ->
+    Args = #{
+        <<"AmountDebit">> => 1.00,
+        <<"Currency">> => <<"EUR">>,
+        <<"Invoice">> => <<"test00001">>,
+        <<"Description">> => <<"This is a test">>,
+        <<"ContinueOnIncomplete">> => 1,
+        <<"Services">> => #{
+            <<"ServiceList">> => [
+            ]
+        },
+        <<"ServicesSelectableByClient">> => <<>>,
+        <<"ServicesExcludedForClient">> => <<>>
+    },
+    api_call(post, "json/Transaction", Args, en, Context).
+
+
+%% @doc Create a new payment with Buckaroo
+%%      Docs: https://dev.buckaroo.nl/Apis
+%%            https://testcheckout.buckaroo.nl/json/Docs/Api/POST-json-Transaction
+%%      Status codes: https://support.buckaroo.nl/categorieën/transacties/status
+-spec create(PaymentId, Context) -> Result
+    when
+        PaymentId :: payment_id(),
+        Context :: z:context(),
+        Result :: payment_result().
+create(PaymentId, Context) ->
+    {ok, Payment} = m_payment:get(PaymentId, Context),
+    case maps:get(<<"currency">>, Payment) of
+        <<"EUR">> = Currency ->
+            PaymentNr = maps:get(<<"payment_nr">>, Payment),
+            RedirectUrl = z_context:abs_url(
+                z_dispatcher:url_for(
+                    buckaroo_payment_redirect,
+                    [ {payment_nr, PaymentNr} ],
+                    Context),
+                Context),
+            WebhookUrl = webhook_url(PaymentNr, Context),
+            Amount = maps:get(<<"amount">>, Payment),
+            Args = case Amount >= 0 of
+                true ->
+                    #{
+                        <<"AmountDebit">> => Amount
+                    };
+                false ->
+                    #{
+                        <<"AmountCredit">> => abs(Amount)
+                    }
+            end,
+            InvoiceNr = invoice_nr(Payment, Context),
+            Excl = z_string:trim( z_convert:to_binary( m_config:get_value(mod_payment_buckaroo, services_excluded, Context) ) ),
+            Sel = z_string:trim( z_convert:to_binary( m_config:get_value(mod_payment_buckaroo, services_selectable, Context) ) ),
+            Args1 = Args#{
+                <<"Currency">> => Currency,
+                <<"Description">> => valid_description( maps:get(<<"description">>, Payment) ),
+                <<"Invoice">> => InvoiceNr,
+                <<"ReturnURL">> => z_convert:to_binary(RedirectUrl),
+                <<"PushURL">> => z_convert:to_binary(WebhookUrl),
+                <<"ContinueOnIncomplete">> => 1,
+                <<"Services">> => #{
+                    <<"ServiceList">> => [
+                    ]
+                },
+                <<"ServicesExcludedForClient">> => Excl,
+                <<"ServicesSelectableByClient">> => Sel,
+                <<"CustomParameters">> => [
+                    #{
+                        <<"Name">> => <<"PaymentNr">>,
+                        <<"Value">> => z_convert:to_binary(PaymentNr)
+                    }
+                ]
+            },
+            Args2 = case maps:get(<<"is_recurring_start">>, Payment, false) of
+                true ->
+                    Args1#{
+                        <<"StartRecurrent">> => true
+                    };
+                false ->
+                    Args1
+            end,
+            Args3 = add_peer(Args2, Context),
+            Args4 = add_user_agent(Args3, Context),
+            Language = maps:get(<<"language">>, Payment, z_context:language(Context)),
+            case api_call(post, "json/Transaction", Args4, Language, Context) of
+                {ok, #{ <<"Key">> := BuckarooKey,
+                        <<"RequiredAction">> := #{
+                                <<"Name">> := <<"Redirect">>,
+                                <<"RedirectURL">> := PaymentUrl
+                            }
+                        } = JSON} ->
+                    m_payment_log:log(
+                        PaymentId,
+                        <<"CREATED">>,
+                        [
+                            {psp_module, mod_payment_buckaroo},
+                            {psp_external_log_id, BuckarooKey},
+                            {description, <<"Created Buckaroo payment ", BuckarooKey/binary>>},
+                            {request_result, JSON}
+                        ],
+                        Context),
+                    {ok, #payment_psp_handler{
+                        psp_module = mod_payment_buckaroo,
+                        psp_external_id = BuckarooKey,
+                        psp_data = JSON,
+                        redirect_uri = PaymentUrl
+                    }};
+                {ok, #{
+                        <<"RequestErrors">> := _,
+                        <<"Status">> := #{
+                            <<"Code">> := #{
+                                <<"Code">> := StatusCode,
+                                <<"Description">> := StatusDescription
+                            }
+                        }
+                    } = JSON} ->
+                    m_payment_log:log(
+                        PaymentId,
+                        <<"ERROR">>,
+                        [
+                            {psp_module, mod_payment_buckaroo},
+                            {description, "API Error creating order with Buckaroo"},
+                            {request_result, JSON},
+                            {request_args, Args}
+                        ],
+                        Context),
+                    ?LOG_ERROR(#{
+                        in => zotonic_mod_payment_buckaroo,
+                        text => <<"Buckaroo API error creating payment">>,
+                        result => error,
+                        reason => StatusCode,
+                        payment_id => PaymentId,
+                        description => StatusDescription
+                    }),
+                    {error, {status, StatusCode}};
+                {ok, JSON} ->
+                    m_payment_log:log(
+                        PaymentId,
+                        <<"ERROR">>,
+                        [
+                            {psp_module, mod_payment_buckaroo},
+                            {description, "API Error creating order with Buckaroo"},
+                            {request_result, JSON},
+                            {request_args, Args}
+                        ],
+                        Context),
+                    ?LOG_ERROR(#{
+                        in => zotonic_mod_payment_buckaroo,
+                        text => <<"Buckaroo API unexpected result creating payment">>,
+                        result => error,
+                        reason => unexpected_json,
+                        payment_id => PaymentId,
+                        data => JSON
+                    }),
+                    {error, json};
+                {error, Error} ->
+                    m_payment_log:log(
+                        PaymentId,
+                        <<"ERROR">>,
+                        [
+                            {psp_module, mod_payment_buckaroo},
+                            {description, "API Error creating order with Buckaroo"},
+                            {request_result, Error},
+                            {request_args, Args}
+                        ],
+                        Context),
+                    ?LOG_ERROR(#{
+                        in => zotonic_mod_payment_buckaroo,
+                        text => <<"Buckaroo API error creating payment">>,
+                        result => error,
+                        reason => Error,
+                        payment_id => PaymentId
+                    }),
+                    {error, Error}
+            end;
+        Currency ->
+            ?LOG_ERROR(#{
+                in => zotonic_mod_payment_buckaroo,
+                text => <<"Buckaroo payment request with non EUR currency">>,
+                result => error,
+                reason => currency,
+                payment_id => PaymentId,
+                data => Currency
+            }),
+            {error, {currency, only_eur}}
+    end.
+
+-spec valid_description(Description) -> ValidDescription
+    when
+        Description :: binary() | undefined,
+        ValidDescription :: binary().
+valid_description(<<>>) -> <<"Payment">>;
+valid_description(undefined) -> <<"Payment">>;
+valid_description(D) when is_binary(D) -> D.
+
+
+%% @doc Return the status of the transaction.
+-spec transaction_status(Key, Context) -> Result
+    when
+        Key :: binary() | string(),
+        Context :: z:context(),
+        Result :: {ok, {integer(), calendar:datetime()}} | {error, term()}.
+transaction_status(Key, Context) ->
+    case api_call(get, "json/Transaction/Status/" ++ z_convert:to_list(Key), <<>>, undefined, Context) of
+        {ok, #{
+            <<"Status">> := #{
+                <<"Code">> := #{
+                    <<"Code">> := StatusCode,
+                    <<"Description">> := _StatusDescription
+                },
+                <<"DateTime">> := DT % <<"2020-07-16T20:00:18+02:00">>
+            }
+        }} ->
+            % https://support.buckaroo.nl/categorieën/transacties/status
+            {ok, {StatusCode, z_datetime:to_datetime(DT)}};
+        {error, _} = Error ->
+            Error
+    end.
+
+
+%% @doc Add the peer IP address to the request, used for fraud detection
+-spec add_peer(Args, Context) -> Args1
+    when
+        Args :: map(),
+        Context :: z:context(),
+        Args1 :: map().
+add_peer(Args, Context) ->
+    case m_req:get(peer, Context) of
+        undefined -> Args;
+        IP ->
+            case inet:parse_address(IP) of
+                {ok, {_, _, _, _}} ->
+                    Args#{
+                        <<"ClientIP">> => #{
+                            <<"Type">> => 0,
+                            <<"Address">> => z_convert:to_binary(IP)
+                        }
+                    };
+                {ok, _} ->
+                    Args#{
+                        <<"ClientIP">> => #{
+                            <<"Type">> => 1,
+                            <<"Address">> => z_convert:to_binary(IP)
+                        }
+                    };
+                {error, _} ->
+                    Args
+            end
+    end.
+
+%% @doc Add the user-agent to the request, used for fraud detection
+-spec add_user_agent(Args, Context) -> Args1
+    when
+        Args :: map(),
+        Context :: z:context(),
+        Args1 :: map().
+add_user_agent(Args, Context) ->
+    case m_req:get(user_agent, Context) of
+        undefined -> Args;
+        UA ->
+            Args#{
+                <<"ClientUserAgent">> => z_convert:to_binary(UA)
+            }
+    end.
+
+%% @doc Return the invoice number for this payment.
+-spec invoice_nr(Payment, Context) -> InvoiceNr
+    when
+        Payment :: payment(),
+        Context :: z:context(),
+        InvoiceNr :: binary().
+invoice_nr(Payment, Context) ->
+    InvNr = case maps:get(<<"props">>, Payment, undefined) of
+        Props when is_list(Props) ->
+            proplists:get_value(invoice_nr, Props);
+        Props when is_map(Props) ->
+            maps:get(<<"invoice_nr">>, Props, maps:get(invoice_nr, Props, undefined));
+        _ ->
+            undefined
+    end,
+    case z_utils:is_empty(InvNr) of
+        true ->
+            PaymentId = maps:get(<<"id">>, Payment),
+            Prefix = m_config:get_value(mod_payment_buckaroo, invoice_nr_prefix, <<"INV">>, Context),
+            iolist_to_binary([
+                Prefix,
+                io_lib:format("~4..0B", [ (PaymentId div 100000000) rem 10000 ]),
+                ".",
+                io_lib:format("~4..0B", [ (PaymentId div 10000) rem 10000 ]),
+                ".",
+                io_lib:format("~4..0B", [ PaymentId rem 10000 ])
+            ]);
+        false ->
+            z_convert:to_binary(InvNr)
+    end.
+
+
+%% @doc Return the url for the callbacks from Buckaroo.
+%%      Allow special hostname for the webhook, useful for testing.
+-spec webhook_url(PaymentNr, Context) -> Url
+    when
+        PaymentNr :: binary(),
+        Context :: z:context(),
+        Url :: binary().
+webhook_url(PaymentNr, Context) ->
+    Path = z_dispatcher:url_for(buckaroo_payment_webhook, [ {payment_nr, PaymentNr} ], Context),
+    case m_config:get_value(mod_payment_buckaroo, webhook_host, Context) of
+        <<"http", _/binary>> = Host -> <<Host/binary, Path/binary>>;
+        _ -> iolist_to_binary( z_context:abs_url(Path, Context) )
+    end.
+
+
+%% @doc Return the URL to the status page on the buckaroo dashboard
+-spec payment_url(BuckarooKey) -> Url
+    when
+        BuckarooKey :: binary() | string(),
+        Url :: binary().
+payment_url(BuckarooKey) ->
+    iolist_to_binary([
+        "https://plaza.buckaroo.nl/Transaction/Transactions/Details",
+        "?transactionKey=", z_convert:to_binary(BuckarooKey)
+    ]).
+
+
+%% @doc Handle the pushed JSON from the webhook.
+-spec webhook_data(JSON, Context) -> Result
+    when
+        JSON :: map(),
+        Context :: z:context(),
+        Result :: ok | {error, term()}.
+webhook_data(#{ <<"Transaction">> := #{ <<"Key">> := ExtId } = JSON }, Context) ->
+    case m_payment:get_by_psp(mod_payment_buckaroo, ExtId, Context) of
+        {ok, Payment} ->
+            PaymentId = maps:get(<<"id">>, Payment),
+            case JSON of
+                #{
+                    <<"Status">> := #{
+                        <<"Code">> := #{
+                            <<"Code">> := StatusCode,
+                            <<"Description">> := StatusDescription
+                        },
+                        <<"DateTime">> := DateTime
+                    }
+                } ->
+                    ?LOG_INFO(#{
+                        in => zotonic_mod_payment_buckaroo,
+                        text => <<"Buckaroo webhook: received payment status">>,
+                        result => ok,
+                        payment_id => PaymentId,
+                        status => StatusCode,
+                        description => StatusDescription
+                    }),
+                    m_payment_log:log(
+                        PaymentId,
+                        <<"STATUS">>,
+                        [
+                            {psp_module, mod_payment_buckaroo},
+                            {description, "Webhook push event"},
+                            {request_result, JSON}
+                        ],
+                        Context),
+                    DT = z_datetime:to_datetime(DateTime),
+                    update_payment_status(PaymentId, StatusCode, DT, Context);
+                _ ->
+                    ?LOG_ERROR(#{
+                        in => zotonic_mod_payment_buckaroo,
+                        text => <<"Buckaroo webhook: push without status">>,
+                        result => error,
+                        reason => no_status_code,
+                        payment_id => PaymentId,
+                        data => JSON
+                    }),
+                    m_payment_log:log(
+                        PaymentId,
+                        <<"ERROR">>,
+                        [
+                            {psp_module, mod_payment_buckaroo},
+                            {description, "Webhook push event without Status"},
+                            {request_result, JSON}
+                        ],
+                        Context),
+                    {error, no_status_code}
+            end;
+        {error, notfound} ->
+            ?LOG_ERROR(#{
+                in => zotonic_mod_payment_buckaroo,
+                text => <<"Buckaroo webhook: unknown PSP id">>,
+                result => error,
+                reason => notfound,
+                psp_external_id => ExtId
+            }),
+            {error, notfound};
+        {error, _} = Error ->
+            ?LOG_ERROR(#{
+                in => zotonic_mod_payment_buckaroo,
+                text => <<"Buckaroo webhook: error fetching payment">>,
+                result => error,
+                reason => Error,
+                psp_external_id => ExtId
+            }),
+            Error
+    end;
+webhook_data(JSON, _Context) ->
+    ?LOG_ERROR(#{
+        in => zotonic_mod_payment_buckaroo,
+        text => <<"Buckaroo webhook: JSON without transaction key">>,
+        result => error,
+        reason => nokey,
+        data => JSON
+    }),
+    {error, nokey}.
+
+
+% Status is one of: open cancelled expired failed pending paid paidout refunded charged_back
+% https://support.buckaroo.nl/categorieën/transacties/status
+-spec update_payment_status(PaymentId, Code, DateTime, Context) -> Result
+    when
+        PaymentId :: payment_id(),
+        Code :: integer(),
+        DateTime :: calendar:datetime(),
+        Context :: z:context(),
+        Result :: ok | {error, term()}.
+update_payment_status(PaymentId, 190, DT, Context) ->
+    % Succes: De transactie is geslaagd en de betaling is ontvangen / goedgekeurd
+    mod_payment:set_payment_status(PaymentId, paid, DT, Context);
+update_payment_status(PaymentId, 490, DT, Context) ->
+    % Mislukt: De transactie is mislukt.
+    mod_payment:set_payment_status(PaymentId, failed, DT, Context);
+update_payment_status(PaymentId, 491, DT, Context) ->
+    % Validatie mislukt: Het transactieverzoek bevatte fouten en kon niet goed verwerkt worden.
+    mod_payment:set_payment_status(PaymentId, failed, DT, Context);
+update_payment_status(PaymentId, 492, DT, Context) ->
+    % Technische fout: Door een technische fout kon de transactie niet worden afgerond.
+    mod_payment:set_payment_status(PaymentId, failed, DT, Context);
+update_payment_status(PaymentId, 690, DT, Context) ->
+    % De transactie is afgewezen door de (derde) payment provider.
+    mod_payment:set_payment_status(PaymentId, cancelled, DT, Context);
+update_payment_status(PaymentId, 790, DT, Context) ->
+    % In afwachting van invoer: De transactie is in de wacht, terwijl de payment
+    % engine staat te wachten op de inbreng van de consument.
+    mod_payment:set_payment_status(PaymentId, pending, DT, Context);
+update_payment_status(PaymentId, 791, DT, Context) ->
+    % In afwachting van verwerking: de transactie wordt verwerkt. Vaak wordt er
+    % gewacht voor de consument om terug te keren van een website van derden,
+    % die nodig is om de transactie te voltooien.
+    mod_payment:set_payment_status(PaymentId, pending, DT, Context);
+update_payment_status(PaymentId, 792, DT, Context) ->
+    % In afwachting van de consument: de consument moet nog een actie ondernemen,
+    % zoals handmatig geld overschrijven vanuit zijn bankomgeving bij een Overboeking.
+    mod_payment:set_payment_status(PaymentId, pending, DT, Context);
+update_payment_status(PaymentId, 793, DT, Context) ->
+    % De transactie staat on-hold.
+    mod_payment:set_payment_status(PaymentId, pending, DT, Context);
+update_payment_status(PaymentId, 890, DT, Context) ->
+    % Geannuleerd door Gebruiker: De transactie is geannuleerd door de klant.
+    mod_payment:set_payment_status(PaymentId, cancelled, DT, Context);
+update_payment_status(PaymentId, 891, DT, Context) ->
+    % Geannuleerd door Merchant: De merchant heeft de transactie geannuleerd.
+    mod_payment:set_payment_status(PaymentId, cancelled, DT, Context);
+update_payment_status(PaymentId, Code, _DT, _Context) ->
+    ?LOG_ERROR(#{
+        in => zotonic_mod_payment_buckaroo,
+        text => <<"Buckaroo: unknown payment status">>,
+        result => error,
+        reason => unknown_status,
+        payment_id => PaymentId,
+        status => Code
+    }),
+    ok.
+
+
+-spec api_call(Method, Endpoint, Args, Language, Context) -> Result
+    when
+        Method :: api_method(),
+        Endpoint :: iodata(),
+        Args :: term(),
+        Language :: atom() | binary() | string() | undefined,
+        Context :: z:context(),
+        Result :: api_result().
+api_call(Method, Endpoint, Args, undefined, Context) ->
+    api_call(Method, Endpoint, Args, z_context:language(Context), Context);
+api_call(Method, Endpoint, Args, Language, Context) ->
+    case api_key(Context) of
+        {ok, {WebSiteKey, SecretKey}} ->
+            Body = z_json:encode(Args),
+            Url = api_url(Context) ++ z_convert:to_list(Endpoint),
+            Auth = authorization(WebSiteKey, SecretKey, Method, Url, Body),
+            Hs = [
+                {"Authorization", z_convert:to_list(Auth)},
+                {"Culture", z_convert:to_list(Language)},
+                {"Software", software()}
+            ],
+            Request = case Method of
+                get ->
+                    {Url, Hs};
+                _ ->
+                    {Url, Hs, "application/json", Body}
+            end,
+            ?LOG_DEBUG(#{
+                in => zotonic_mod_payment_buckaroo,
+                text => <<"Making API call to Buckaroo">>,
+                method => Method,
+                url => Url,
+                args => Args
+            }),
+            case httpc:request(
+                Method, Request,
+                [
+                    {autoredirect, true},
+                    {relaxed, false},
+                    {timeout, ?TIMEOUT_REQUEST},
+                    {connect_timeout, ?TIMEOUT_CONNECT}
+                ],
+                [
+                    {sync, true},
+                    {body_format, binary}
+                ])
+            of
+                {ok, {{_, X20x, _}, Headers, Payload}} when ((X20x >= 200) and (X20x < 400)) ->
+                    case proplists:get_value("content-type", Headers) of
+                        undefined ->
+                            {ok, Payload};
+                        ContentType ->
+                            case binary:match(list_to_binary(ContentType), <<"json">>) of
+                                nomatch ->
+                                    {ok, Payload};
+                                _ ->
+                                    Props = z_json:decode(Payload),
+                                    {ok, Props}
+                            end
+                    end;
+                {ok, {{_, Code, _}, Headers, Payload}} ->
+                    ?LOG_ERROR(#{
+                        in => zotonic_mod_payment_buckaroo,
+                        text => <<"Buckaroo API call error return">>,
+                        result => error,
+                        reason => Code,
+                        status => Code,
+                        payload => Payload,
+                        headers => Headers
+                    }),
+                    {error, Code};
+                {error, Reason} = Error ->
+                    ?LOG_ERROR(#{
+                        in => zotonic_mod_payment_buckaroo,
+                        text => <<"Buckaroo API call error">>,
+                        result => error,
+                        reason => Reason,
+                        url => Url
+                    }),
+                    Error
+            end;
+        {error, notfound} ->
+            {error, api_key_not_set}
+    end.
+
+-spec software() -> Software
+    when
+        Software :: string().
+software() ->
+    binary_to_list(
+        z_json:encode(#{
+            <<"PlatformName">> => <<"Zotonic">>,
+            <<"PlatformVersion">> => z_convert:to_binary(?ZOTONIC_VERSION),
+            <<"ModuleSupplier">> => <<"Driebit">>,
+            <<"ModuleName">> => <<"mod_payment_buckaroo">>,
+            <<"ModuleVersion">> => <<>>
+        })
+    ).
+
+%% @doc Check if the authorization header of the current request is valid.
+-spec is_valid_authorization_header(Body, Context) -> IsValid
+    when
+        Body :: binary(),
+        Context :: z:context(),
+        IsValid :: boolean().
+is_valid_authorization_header(Body, Context) ->
+    case api_key(Context) of
+        {ok, {WebSiteKey, SecretKey}} ->
+            Method = m_req:get(method, Context),
+            Url = iolist_to_binary([
+                    "https://",
+                    m_req:get(host, Context),
+                    m_req:get(raw_path, Context)
+                ]),
+            Hdr = z_convert:to_binary( z_context:get_req_header(<<"authorization">>, Context) ),
+            case Hdr of
+                <<"hmac ", Hash/binary>> ->
+                    case binary:split(Hash, <<":">>, [global]) of
+                        [ WebSiteKey, Sig, Nonce, Timestamp ] ->
+                            case calc_sig(WebSiteKey, SecretKey, Method,
+                                          Url, Body, Nonce, Timestamp)
+                            of
+                                Sig ->
+                                    true;
+                                Expected ->
+                                    ?LOG_ERROR(#{
+                                        in => zotonic_mod_payment_buckaroo,
+                                        text => <<"Buckaroo authorization signature mismatch">>,
+                                        result => error,
+                                        reason => signature_mismatch,
+                                        expected => Expected,
+                                        signature => Sig
+                                    }),
+                                    false
+                            end;
+                        _ ->
+                            ?LOG_ERROR(#{
+                                in => zotonic_mod_payment_buckaroo,
+                                text => <<"Buckaroo authorization key pattern mismatch">>,
+                                result => error,
+                                reason => authorization_key_pattern_mismatch,
+                                hash => Hash
+                            }),
+                            false
+                    end;
+                _ ->
+                    ?LOG_ERROR(#{
+                        in => zotonic_mod_payment_buckaroo,
+                        text => <<"Buckaroo authorization header mismatch">>,
+                        result => error,
+                        reason => authorization_header_mismatch,
+                        header => Hdr
+                    }),
+                    false
+            end;
+        {error, _} ->
+            false
+    end.
+
+-spec authorization(WebSiteKey, SecretKey, Method, Url, Body) -> Authorization
+    when
+        WebSiteKey :: binary(),
+        SecretKey :: binary(),
+        Method :: http_method(),
+        Url :: iodata(),
+        Body :: iodata(),
+        Authorization :: binary().
+authorization(WebSiteKey, SecretKey, Method, Url, Body) ->
+    Nonce = z_ids:id(16),
+    Timestamp = z_datetime:timestamp(),
+    Sig = calc_sig(WebSiteKey, SecretKey, Method, Url, Body, Nonce, Timestamp),
+    iolist_to_binary([
+        "hmac ",
+        WebSiteKey, ":",
+        Sig, ":",
+        Nonce, ":",
+        integer_to_binary(Timestamp)
+    ]).
+
+-spec calc_sig(WebSiteKey, SecretKey, Method, Url, Body, Nonce, Timestamp) -> Signature
+    when
+        WebSiteKey :: binary(),
+        SecretKey :: binary(),
+        Method :: http_method(),
+        Url :: iodata(),
+        Body :: iodata(),
+        Nonce :: binary(),
+        Timestamp :: integer() | binary(),
+        Signature :: binary().
+calc_sig(WebSiteKey, SecretKey, Method, Url, Body, Nonce, Timestamp) ->
+    BodyMD5 = crypto:hash(md5, Body),
+    BodyHash = base64:encode(BodyMD5),
+    SigData = [
+        WebSiteKey,
+        method_binary(Method),
+        auth_uri(Url),
+        z_convert:to_binary(Timestamp),
+        Nonce,
+        case method_binary(Method) of
+            <<"GET">> -> <<>>;
+            _ -> BodyHash
+        end
+    ],
+    Sig = crypto:mac(hmac, sha256, SecretKey, SigData),
+    base64:encode(Sig).
+
+-spec method_binary(Method) -> MethodBin
+    when
+        Method :: http_method(),
+        MethodBin :: binary().
+method_binary(get) -> <<"GET">>;
+method_binary(post) -> <<"POST">>;
+method_binary('GET') -> <<"GET">>;
+method_binary('POST') -> <<"POST">>;
+method_binary(<<"GET">>) -> <<"GET">>;
+method_binary(<<"POST">>) -> <<"POST">>.
+
+-spec auth_uri(Url) -> AuthUrl
+    when
+        Url :: iodata(),
+        AuthUrl :: binary().
+auth_uri("https://" ++ Uri) ->
+    z_string:to_lower(z_url:url_encode(Uri));
+auth_uri("http://" ++ Uri) ->
+    z_string:to_lower(z_url:url_encode(Uri));
+auth_uri(<<"https://", Uri/binary>>) ->
+    z_string:to_lower(z_url:url_encode(Uri));
+auth_uri(<<"http://", Uri/binary>>) ->
+    z_string:to_lower(z_url:url_encode(Uri)).
+
+-spec is_test(Context) -> IsTest
+    when
+        Context :: z:context(),
+        IsTest :: boolean().
+is_test(Context) ->
+    not z_convert:to_bool( m_config:get_value(mod_payment_buckaroo, is_live, Context) ).
+
+-spec api_url(Context) -> Url
+    when
+        Context :: z:context(),
+        Url :: string().
+api_url(Context) ->
+    case is_test(Context) of
+        true -> ?BUCKAROO_TEST_API_URL;
+        false -> ?BUCKAROO_API_URL
+    end.
+
+-spec api_key(Context) -> Result
+    when
+        Context :: z:context(),
+        Result :: {ok, {binary(), binary()}} | {error, notfound}.
+api_key(Context) ->
+    WebsiteKey = m_config:get_value(mod_payment_buckaroo, website_key, Context),
+    SecretKey = m_config:get_value(mod_payment_buckaroo, secret_key, Context),
+    case z_utils:is_empty(WebsiteKey) or z_utils:is_empty(SecretKey) of
+        true ->
+            {error, notfound};
+        false ->
+            {ok, {WebsiteKey, SecretKey}}
+    end.
