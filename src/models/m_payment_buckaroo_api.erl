@@ -452,7 +452,7 @@ webhook_data(#{ <<"Transaction">> := #{ <<"Key">> := ExtId } = JSON }, Context) 
                         ],
                         Context),
                     DT = z_datetime:to_datetime(DateTime),
-                    ok = maybe_update_contact(
+                    _ = maybe_update_contact(
                         PaymentId,
                         ExtId,
                         payment_link_contact(JSON),
