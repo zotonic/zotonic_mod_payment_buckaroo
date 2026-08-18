@@ -92,7 +92,7 @@ moved_temporarily(Context) ->
     Context1 = z_context:ensure_qs(Context),
     case is_signature_ok(Context1) of
         false ->
-            redirect(payment_psp_cancel, Context1);
+            redirect(Context1);
         true ->
             StatusCode = z_convert:to_integer(z_context:get_q(<<"brq_statuscode">>, Context1)),
             Timestamp = z_context:get_q(<<"brq_timestamp">>, Context1),
@@ -118,32 +118,7 @@ moved_temporarily(Context) ->
                         timestamp => Timestamp
                     })
             end,
-            case StatusCode of
-                190 ->
-                    % Payment done
-                    redirect(payment_psp_done, Context1);
-                790 ->
-                    % Pending (on customer)
-                    redirect(payment_psp_done, Context1);
-                791 ->
-                    % Pending (on redirect to website)
-                    redirect(payment_psp_done, Context1);
-                793 ->
-                    % Hold (waiting for funds)
-                    redirect(payment_psp_done, Context1);
-                490 ->
-                    % Failed (Mislukt)
-                    redirect(payment_psp_done, Context1);
-                690 ->
-                    % Failed (afgewezen)
-                    redirect(payment_psp_done, Context1);
-                890 ->
-                    % Canceled by customer
-                    redirect(payment_psp_cancel, Context1);
-                _ ->
-                    % Probably canceled
-                    redirect(payment_psp_cancel, Context1)
-            end
+            redirect(Context1)
     end.
 
 -spec set_status(PspId, StatusCode, Timestamp, Context) -> Result
@@ -167,10 +142,47 @@ set_status(PspId, StatusCode, Timestamp, Context) ->
             Now_10s = prev_sec(10, Now),
             TimestampDT = z_datetime:to_datetime(Timestamp, <<"Europe/Berlin">>),
             DateTime = erlang:max(Now_10m, erlang:min(Now_10s, TimestampDT)),
+            ok = m_payment_buckaroo_api:maybe_update_contact(
+                Id,
+                PspId,
+                payment_link_contact(Context),
+                maps:get(<<"status">>, Payment),
+                StatusCode,
+                Context),
             m_payment_buckaroo_api:update_payment_status(Id, StatusCode, DateTime, Context);
         {error, _} = Error ->
             Error
     end.
+
+payment_link_contact(Context) ->
+    buckaroo_name_props(
+        first_defined([
+            z_context:get_q(<<"brq_customer_name">>, Context),
+            z_context:get_q(<<"brq_SERVICE_ideal_consumerName">>, Context)
+        ])).
+
+buckaroo_name_props(Name) when is_binary(Name) ->
+    case binary:split(z_string:trim(Name), <<" ">>, [global, trim_all]) of
+        [] ->
+            #{};
+        [<<>>] ->
+            #{};
+        [Surname] ->
+            #{ <<"name_surname">> => Surname };
+        [First | Rest] ->
+            #{ <<"name_first">> => First,
+               <<"name_surname">> => iolist_to_binary(lists:join(<<" ">>, Rest)) }
+    end;
+buckaroo_name_props(_) ->
+    #{}.
+
+first_defined([Value | Rest]) ->
+    case z_utils:is_empty(Value) of
+        true -> first_defined(Rest);
+        false -> Value
+    end;
+first_defined([]) ->
+    undefined.
 
 -spec prev_min(N, DateTime) -> DateTime
     when
@@ -186,16 +198,15 @@ prev_min(N, DT) when N > 0 -> prev_min(N-1, z_datetime:prev_minute(DT)).
 prev_sec(0, DT) -> DT;
 prev_sec(N, DT) when N > 0 -> prev_sec(N-1, z_datetime:prev_second(DT)).
 
--spec redirect(Dispatch, Context) -> Result
+-spec redirect(Context) -> Result
     when
-        Dispatch :: atom(),
         Context :: z:context(),
         Result :: redirect_response().
-redirect(Dispatch, Context) ->
+redirect(Context) ->
     Args = [
         {payment_nr, z_context:get_q(<<"payment_nr">>, Context)}
     ],
-    Location = z_context:abs_url(z_dispatcher:url_for(Dispatch, Args, Context), Context),
+    Location = z_context:abs_url(z_dispatcher:url_for(payment_psp_done, Args, Context), Context),
     {{true, Location}, Context}.
 
 

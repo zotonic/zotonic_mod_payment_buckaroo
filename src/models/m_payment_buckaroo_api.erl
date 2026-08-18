@@ -22,6 +22,7 @@
     create/2,
     webhook_data/2,
     transaction_status/2,
+    maybe_update_contact/6,
 
     is_test/1,
     api_key/1,
@@ -289,7 +290,7 @@ valid_description(D) when is_binary(D) -> D.
         Context :: z:context(),
         Result :: {ok, {integer(), calendar:datetime()}} | {error, term()}.
 transaction_status(Key, Context) ->
-    case api_call(get, "json/Transaction/Status/" ++ z_convert:to_list(Key), <<>>, undefined, Context) of
+    case transaction_data(Key, Context) of
         {ok, #{
             <<"Status">> := #{
                 <<"Code">> := #{
@@ -304,6 +305,9 @@ transaction_status(Key, Context) ->
         {error, _} = Error ->
             Error
     end.
+
+transaction_data(Key, Context) ->
+    api_call(get, "json/Transaction/Status/" ++ z_convert:to_list(Key), <<>>, undefined, Context).
 
 
 %% @doc Add the peer IP address to the request, used for fraud detection
@@ -448,6 +452,13 @@ webhook_data(#{ <<"Transaction">> := #{ <<"Key">> := ExtId } = JSON }, Context) 
                         ],
                         Context),
                     DT = z_datetime:to_datetime(DateTime),
+                    ok = maybe_update_contact(
+                        PaymentId,
+                        ExtId,
+                        payment_link_contact(JSON),
+                        maps:get(<<"status">>, Payment),
+                        StatusCode,
+                        Context),
                     update_payment_status(PaymentId, StatusCode, DT, Context);
                 _ ->
                     ?LOG_ERROR(#{
@@ -497,6 +508,149 @@ webhook_data(JSON, _Context) ->
         data => JSON
     }),
     {error, nokey}.
+
+payment_link_contact(JSON) ->
+    Consumer = maps:get(<<"Consumer">>, JSON, #{}),
+    Customer = maps:get(<<"Customer">>, JSON, #{}),
+    Invoice = maps:get(<<"Invoice">>, JSON, #{}),
+    Address = first_map([
+        maps:get(<<"BillingAddress">>, JSON, undefined),
+        maps:get(<<"InvoiceAddress">>, JSON, undefined),
+        maps:get(<<"Address">>, Consumer, undefined),
+        maps:get(<<"Address">>, Customer, undefined),
+        maps:get(<<"Address">>, Invoice, undefined)
+    ]),
+    maps:merge(
+        buckaroo_address_props(Address),
+        maps:merge(
+            buckaroo_name_props(first_defined([
+                maps:get(<<"Name">>, Consumer, undefined),
+                maps:get(<<"Name">>, Customer, undefined),
+                maps:get(<<"CustomerName">>, JSON, undefined)
+            ])),
+            #{
+                <<"email">> => first_defined([
+                    maps:get(<<"Email">>, Consumer, undefined),
+                    maps:get(<<"Email">>, Customer, undefined),
+                    maps:get(<<"CustomerEmail">>, JSON, undefined)
+                ]),
+                <<"phone">> => first_defined([
+                    maps:get(<<"Phone">>, Consumer, undefined),
+                    maps:get(<<"Phone">>, Customer, undefined),
+                    maps:get(<<"CustomerPhone">>, JSON, undefined)
+                ])
+            })).
+
+buckaroo_name_props(Name) when is_binary(Name) ->
+    case binary:split(z_string:trim(Name), <<" ">>, [global, trim_all]) of
+        [] ->
+            #{};
+        [<<>>] ->
+            #{};
+        [Surname] ->
+            #{ <<"name_surname">> => Surname };
+        [First | Rest] ->
+            #{ <<"name_first">> => First,
+               <<"name_surname">> => iolist_to_binary(lists:join(<<" ">>, Rest)) }
+    end;
+buckaroo_name_props(_) ->
+    #{}.
+
+buckaroo_address_props(Address) when is_map(Address) ->
+    #{
+        <<"address_street_1">> => first_defined([
+            maps:get(<<"Street">>, Address, undefined),
+            maps:get(<<"Street1">>, Address, undefined),
+            maps:get(<<"Line1">>, Address, undefined)
+        ]),
+        <<"address_street_2">> => first_defined([
+            maps:get(<<"Street2">>, Address, undefined),
+            maps:get(<<"Line2">>, Address, undefined)
+        ]),
+        <<"address_postcode">> => first_defined([
+            maps:get(<<"PostalCode">>, Address, undefined),
+            maps:get(<<"ZipCode">>, Address, undefined)
+        ]),
+        <<"address_city">> => maps:get(<<"City">>, Address, undefined),
+        <<"address_state">> => first_defined([
+            maps:get(<<"State">>, Address, undefined),
+            maps:get(<<"Region">>, Address, undefined)
+        ]),
+        <<"address_country">> => first_defined([
+            maps:get(<<"Country">>, Address, undefined),
+            maps:get(<<"CountryCode">>, Address, undefined)
+        ])
+    };
+buckaroo_address_props(_) ->
+    #{}.
+
+first_map([Value | _Rest]) when is_map(Value) ->
+    Value;
+first_map([_ | Rest]) ->
+    first_map(Rest);
+first_map([]) ->
+    #{}.
+
+first_defined([Value | Rest]) ->
+    case z_utils:is_empty(Value) of
+        true -> first_defined(Rest);
+        false -> Value
+    end;
+first_defined([]) ->
+    undefined.
+
+maybe_update_contact(_PaymentId, _BuckarooId, _Contact, _CurrentStatus, 0, _Context) ->
+    ok;
+maybe_update_contact(PaymentId, BuckarooId, Contact, new, StatusCode, Context) ->
+    case buckaroo_status(StatusCode) of
+        undefined ->
+            ok;
+        new ->
+            ok;
+        _Status ->
+            maybe_update_contact_1(PaymentId, BuckarooId, Contact, Context)
+    end;
+maybe_update_contact(_PaymentId, _BuckarooId, _Contact, _CurrentStatus, _StatusCode, _Context) ->
+    ok.
+
+maybe_update_contact_1(PaymentId, BuckarooId, Contact, Context) ->
+    case m_payment:maybe_update_contact(PaymentId, Contact, Context) of
+        ok ->
+            ok;
+        {error, need_contact} ->
+            maybe_fetch_payment_link_contact(PaymentId, BuckarooId, Context);
+        {error, _} = Error ->
+            Error
+    end.
+
+buckaroo_status(190) -> paid;
+buckaroo_status(490) -> failed;
+buckaroo_status(491) -> failed;
+buckaroo_status(492) -> failed;
+buckaroo_status(690) -> cancelled;
+buckaroo_status(790) -> pending;
+buckaroo_status(791) -> pending;
+buckaroo_status(792) -> pending;
+buckaroo_status(793) -> pending;
+buckaroo_status(890) -> cancelled;
+buckaroo_status(891) -> cancelled;
+buckaroo_status(_) -> undefined.
+
+maybe_fetch_payment_link_contact(PaymentId, BuckarooId, Context) ->
+    case transaction_data(BuckarooId, Context) of
+        {ok, JSON} ->
+            case m_payment:maybe_update_contact(
+                PaymentId,
+                payment_link_contact(maps:get(<<"Transaction">>, JSON, JSON)),
+                Context)
+            of
+                ok -> ok;
+                {error, need_contact} -> ok;
+                {error, _} = Error -> Error
+            end;
+        {error, _} ->
+            ok
+    end.
 
 
 % Status is one of: open cancelled expired failed pending paid paidout refunded charged_back
