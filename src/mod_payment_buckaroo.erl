@@ -105,7 +105,7 @@ observe_payment_psp_status_sync(#payment_psp_status_sync{
     }, Context) ->
     case m_payment_buckaroo_api:transaction_status(BuckarooId, Context) of
         {ok, {Code, DT}} ->
-            ok = maybe_update_contact(PaymentId, BuckarooId, Code, Context),
+            _ = maybe_update_contact(PaymentId, BuckarooId, Code, Context),
             m_payment_buckaroo_api:update_payment_status(PaymentId, Code, DT, Context),
             ok;
         {error, 404} = Error ->
