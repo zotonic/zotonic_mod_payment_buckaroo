@@ -142,7 +142,7 @@ set_status(PspId, StatusCode, Timestamp, Context) ->
             Now_10s = prev_sec(10, Now),
             TimestampDT = z_datetime:to_datetime(Timestamp, <<"Europe/Berlin">>),
             DateTime = erlang:max(Now_10m, erlang:min(Now_10s, TimestampDT)),
-            ok = m_payment_buckaroo_api:maybe_update_contact(
+            _ = m_payment_buckaroo_api:maybe_update_contact(
                 Id,
                 PspId,
                 payment_link_contact(Context),
