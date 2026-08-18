@@ -79,7 +79,7 @@ All other codes are ignored and logged with an error.
 Development configuration
 -------------------------
 
- * `mod_payment_buckaroo.webhook_host` this should be the host (with `http:` prefix)
+ * `mod_payment_buckaroo.webhook_host` this should be the host (with `https:` prefix)
    where Buckaroo should send the webhook messages. Only use this if your (development)
    site is reachable from the outside via a different URL than the configured hostnames.
 
