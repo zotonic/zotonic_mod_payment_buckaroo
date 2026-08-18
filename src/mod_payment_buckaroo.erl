@@ -82,7 +82,12 @@
 %% @doc Payment request, make new payment with Buckaroo, return
 %%      payment (buckaroo) details and a redirect uri for the user
 %%      to handle the payment.
-observe_payment_psp_request(#payment_psp_request{ payment_id = PaymentId, currency = <<"EUR">> }, Context) ->
+observe_payment_psp_request(#payment_psp_request{
+        payment_id = PaymentId,
+        currency = <<"EUR">>,
+        preferred_psp_module = PreferredPspModule
+    }, Context) when PreferredPspModule =:= undefined;
+                     PreferredPspModule =:= ?MODULE ->
     m_payment_buckaroo_api:create(PaymentId, Context);
 observe_payment_psp_request(#payment_psp_request{}, _Context) ->
     undefined.
@@ -100,6 +105,7 @@ observe_payment_psp_status_sync(#payment_psp_status_sync{
     }, Context) ->
     case m_payment_buckaroo_api:transaction_status(BuckarooId, Context) of
         {ok, {Code, DT}} ->
+            _ = maybe_update_contact(PaymentId, BuckarooId, Code, Context),
             m_payment_buckaroo_api:update_payment_status(PaymentId, Code, DT, Context),
             ok;
         {error, 404} = Error ->
@@ -116,3 +122,17 @@ observe_payment_psp_status_sync(#payment_psp_status_sync{
     end;
 observe_payment_psp_status_sync(#payment_psp_status_sync{}, _Context) ->
     undefined.
+
+maybe_update_contact(PaymentId, BuckarooId, Code, Context) ->
+    case m_payment:get(PaymentId, Context) of
+        {ok, #{ <<"status">> := CurrentStatus }} ->
+            m_payment_buckaroo_api:maybe_update_contact(
+                PaymentId,
+                BuckarooId,
+                #{},
+                CurrentStatus,
+                Code,
+                Context);
+        {error, _} = Error ->
+            Error
+    end.
