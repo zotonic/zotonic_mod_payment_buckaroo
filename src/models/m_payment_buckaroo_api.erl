@@ -123,6 +123,7 @@ create(PaymentId, Context) ->
                 z_dispatcher:url_for(
                     buckaroo_payment_redirect,
                     [ {payment_nr, PaymentNr} ],
+                    none,
                     Context),
                 Context),
             WebhookUrl = webhook_url(PaymentNr, Context),
@@ -395,7 +396,11 @@ invoice_nr(Payment, Context) ->
         Context :: z:context(),
         Url :: binary().
 webhook_url(PaymentNr, Context) ->
-    Path = z_dispatcher:url_for(buckaroo_payment_webhook, [ {payment_nr, PaymentNr} ], Context),
+    Path = z_dispatcher:url_for(
+        buckaroo_payment_webhook,
+        [ {payment_nr, PaymentNr} ],
+        none,
+        Context),
     case m_config:get_value(mod_payment_buckaroo, webhook_host, Context) of
         <<"http", _/binary>> = Host -> <<Host/binary, Path/binary>>;
         _ -> iolist_to_binary( z_context:abs_url(Path, Context) )

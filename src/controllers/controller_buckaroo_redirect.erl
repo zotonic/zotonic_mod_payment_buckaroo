@@ -206,7 +206,9 @@ redirect(Context) ->
     Args = [
         {payment_nr, z_context:get_q(<<"payment_nr">>, Context)}
     ],
-    Location = z_context:abs_url(z_dispatcher:url_for(payment_psp_done, Args, Context), Context),
+    Location = z_context:abs_url(
+        z_dispatcher:url_for(payment_psp_done, Args, none, Context),
+        Context),
     {{true, Location}, Context}.
 
 
