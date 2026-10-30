@@ -52,6 +52,30 @@
 % }
 
 -module(controller_buckaroo_redirect).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "integrator", "controller",
+        "payments", "api_and_integration", "routing_and_redirects"
+    ]
+}).
+-moduledoc("
+Handle Buckaroo checkout callbacks.
+
+Handle Buckaroo's POST return at `/buckaroo/ready/:payment_nr`. Verify the
+returned signature before updating a known transaction's local status. Redirect
+the visitor to `payment_psp_done` even when signature verification fails; an invalid
+signature does not authorize a status change.
+
+Generate the endpoint through its dispatch rule, for example:
+
+```django
+{% url buckaroo_payment_redirect payment_nr=payment_nr %}
+```
+
+This provider-facing endpoint uses the verification described above rather than
+an administrator login.
+").
+
 
 -export([
     allowed_methods/1,

@@ -1,0 +1,1 @@
+{% include "_admin_payment_config_section.tpl" module=`mod_payment_buckaroo` title=_"Buckaroo" explanation=_"Unknown payments can arrive through verified webhooks. This checkout API does not support discovery polling." %}

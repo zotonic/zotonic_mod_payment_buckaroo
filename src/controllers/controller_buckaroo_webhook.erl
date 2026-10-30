@@ -21,6 +21,30 @@
 %% limitations under the License.
 
 -module(controller_buckaroo_webhook).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "integrator", "controller",
+        "payments", "api_and_integration", "security", "send_and_receive"
+    ]
+}).
+-moduledoc("
+Handle Buckaroo checkout callbacks.
+
+Accept JSON POST pushes at `/buckaroo/webhook` and
+`/buckaroo/webhook/:payment_nr`. Verify the authorization header over the original
+body before decoding and processing the transaction. Verified debit updates enter
+the shared receive policy; processing failures return 500 for retry.
+
+Generate the endpoint through its dispatch rule, for example:
+
+```django
+{% url buckaroo_payment_webhook_generic %}
+```
+
+This provider-facing endpoint uses the verification described above rather than
+an administrator login.
+").
+
 
 -export([
     allowed_methods/1,
@@ -56,7 +80,7 @@ is_authorized(Context) ->
     {Body, Context1} = cowmachine_req:req_body(Context),
     case m_payment_buckaroo_api:is_valid_authorization_header(Body, Context1) of
         true ->
-            {true, z_context:set(<<"body">>, Body, Context1)};
+            {true, z_context:set(buckaroo_webhook_body, Body, Context1)};
         false ->
             ?LOG_ERROR(#{
                 in => zotonic_mod_payment_buckaroo,
@@ -79,7 +103,7 @@ process(<<"POST">>, AcceptedCT, _ProvidedCT, Context) ->
         {Decoded, Context1} = z_controller_helper:decode_request_noz(AcceptedCT, Context),
         JSON = case Decoded of
             #{ <<"Transaction">> := _ } = M -> M;
-            _ -> z_json:decode(z_context:get(<<"body">>, Context1))
+            _ -> z_json:decode(z_context:get(buckaroo_webhook_body, Context1))
         end,
         case m_payment_buckaroo_api:webhook_data(JSON, Context1) of
             ok ->

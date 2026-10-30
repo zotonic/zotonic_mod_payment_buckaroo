@@ -92,3 +92,13 @@ will be used and the following bank and credit cards can be used for testing:
 https://support.buckaroo.nl/categorieën/integratie/test-gegevens
 
 
+
+
+Receiving external payments
+---------------------------
+
+With `mod_payment.accept_unknown_payments = true`, verified incoming debit
+pushes can import payments not initiated by Zotonic. Register `/buckaroo/webhook`
+for generic pushes; existing numbered webhook URLs continue to work. Policy,
+identity checks, deduplication, and notifications are handled by `mod_payment`.
+Credit transactions are not imported as incoming payments. No polling is added.

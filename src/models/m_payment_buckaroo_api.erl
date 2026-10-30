@@ -17,10 +17,39 @@
 %% limitations under the License.
 
 -module(m_payment_buckaroo_api).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "integrator", "model",
+        "payments", "api_and_integration"
+    ]
+}).
+-moduledoc("
+Create Buckaroo transactions and normalize their verified status updates.
+
+This is an Erlang API module without template model paths.
+`create(PaymentId, Context)` creates checkout for an existing local payment and
+returns `{ok, #payment_psp_handler{}}` or an error. Calls use the configured website
+and secret keys and the live/test environment selected by mod_payment_buckaroo.
+
+For example, `m_payment_buckaroo_api:transaction_status(TransactionId, Context)`
+returns `{ok, {StatusCode, DateTime}}` or `{error, Reason}`.
+`is_valid_authorization_header/2` verifies a push against its original request body;
+`webhook_data/2` processes decoded, verified push data. The controller performs
+verification before invoking that processing function.
+
+These functions are intended for trusted server callers and do not implement
+model-path ACL checks. Use the shared payment-request notification for application
+checkout and the shared receive policy for verified incoming payments.
+").
+
+
+%% Exported for the documented HTTP contract tests in test/.
+-export([api_call/5]).
 
 -export([
     create/2,
     webhook_data/2,
+    webhook_payment/1,
     transaction_status/2,
     maybe_update_contact/6,
 
@@ -425,99 +454,70 @@ payment_url(BuckarooKey) ->
         JSON :: map(),
         Context :: z:context(),
         Result :: ok | {error, term()}.
-webhook_data(#{ <<"Transaction">> := #{ <<"Key">> := ExtId } = JSON }, Context) ->
-    case m_payment:get_by_psp(mod_payment_buckaroo, ExtId, Context) of
-        {ok, Payment} ->
-            PaymentId = maps:get(<<"id">>, Payment),
-            case JSON of
-                #{
-                    <<"Status">> := #{
-                        <<"Code">> := #{
-                            <<"Code">> := StatusCode,
-                            <<"Description">> := StatusDescription
-                        },
-                        <<"DateTime">> := DateTime
-                    }
-                } ->
-                    ?LOG_INFO(#{
-                        in => zotonic_mod_payment_buckaroo,
-                        text => <<"Buckaroo webhook: received payment status">>,
-                        result => ok,
-                        payment_id => PaymentId,
-                        status => StatusCode,
-                        description => StatusDescription
-                    }),
-                    m_payment_log:log(
-                        PaymentId,
-                        <<"STATUS">>,
-                        [
-                            {psp_module, mod_payment_buckaroo},
-                            {description, "Webhook push event"},
-                            {request_result, JSON}
-                        ],
-                        Context),
-                    DT = z_datetime:to_datetime(DateTime),
-                    _ = maybe_update_contact(
-                        PaymentId,
-                        ExtId,
-                        payment_link_contact(JSON),
-                        maps:get(<<"status">>, Payment),
-                        StatusCode,
-                        Context),
-                    update_payment_status(PaymentId, StatusCode, DT, Context);
-                _ ->
-                    ?LOG_ERROR(#{
-                        in => zotonic_mod_payment_buckaroo,
-                        text => <<"Buckaroo webhook: push without status">>,
-                        result => error,
-                        reason => no_status_code,
-                        payment_id => PaymentId,
-                        data => JSON
-                    }),
-                    m_payment_log:log(
-                        PaymentId,
-                        <<"ERROR">>,
-                        [
-                            {psp_module, mod_payment_buckaroo},
-                            {description, "Webhook push event without Status"},
-                            {request_result, JSON}
-                        ],
-                        Context),
-                    {error, no_status_code}
+webhook_data(JSON, Context) ->
+    case webhook_payment(JSON) of
+        {ok, Data} ->
+            % Preserve contact enrichment for existing payment links, including
+            % the provider lookup when the push contains incomplete details.
+            maybe_update_webhook_contact(Data, JSON, Context),
+            case mod_payment:receive_payment(mod_payment_buckaroo, Data, Context) of
+                {ok, _} -> ok;
+                {error, _} = Error -> Error
             end;
-        {error, notfound} ->
-            ?LOG_ERROR(#{
-                in => zotonic_mod_payment_buckaroo,
-                text => <<"Buckaroo webhook: unknown PSP id">>,
-                result => error,
-                reason => notfound,
-                psp_external_id => ExtId
-            }),
-            {error, notfound};
-        {error, _} = Error ->
-            ?LOG_ERROR(#{
-                in => zotonic_mod_payment_buckaroo,
-                text => <<"Buckaroo webhook: error fetching payment">>,
-                result => error,
-                reason => Error,
-                psp_external_id => ExtId
-            }),
-            Error
+        {error, credit_transaction} -> ok;
+        {error, unknown_status} -> ok;
+        {error, _} = Error -> Error
+    end.
+
+maybe_update_webhook_contact(#{psp_external_id := ExtId, contact := Contact} = Data,
+        #{ <<"Transaction">> := #{ <<"Status">> := #{ <<"Code">> := #{ <<"Code">> := Code } } } }, Context) ->
+    case m_payment:get_by_psp(mod_payment_buckaroo, ExtId, Context) of
+        {ok, #{ <<"id">> := Id, <<"status">> := Status } = Payment} ->
+            case payment_receive:validate(Data) =:= ok
+                 andalso payment_receive:matches(mod_payment_buckaroo, Data, Payment) of
+                true -> _ = maybe_update_contact(Id, ExtId, Contact, Status, Code, Context), ok;
+                false -> ok
+            end;
+        _ -> ok
+    end.
+
+%% @doc Normalize a signed transaction push. Credit/refund transactions are not
+%% incoming payments and must not be imported as positive receipts.
+-spec webhook_payment(JSON) -> Result
+    when JSON :: map(), Result :: {ok, map()} | {error, term()}.
+webhook_payment(#{ <<"Transaction">> := #{
+        <<"Key">> := ExtId,
+        <<"Status">> := #{ <<"Code">> := #{ <<"Code">> := Code },
+                           <<"DateTime">> := DateTime }
+    } = Transaction }) ->
+    case {payment_status(Code), maps:get(<<"AmountCredit">>, Transaction, 0)} of
+        {{ok, Status}, Credit} when Credit == 0; Credit =:= null ->
+            {ok, #{
+                psp_external_id => ExtId,
+                status => Status,
+                status_date => z_datetime:to_datetime(DateTime),
+                amount => maps:get(<<"AmountDebit">>, Transaction, undefined),
+                currency => maps:get(<<"Currency">>, Transaction, undefined),
+                description => maps:get(<<"Description">>, Transaction, <<>>),
+                contact => payment_link_contact(Transaction),
+                psp_data => Transaction
+            }};
+        {{error, _} = Error, _} -> Error;
+        _ -> {error, credit_transaction}
     end;
-webhook_data(JSON, _Context) ->
-    ?LOG_ERROR(#{
-        in => zotonic_mod_payment_buckaroo,
-        text => <<"Buckaroo webhook: JSON without transaction key">>,
-        result => error,
-        reason => nokey,
-        data => JSON
-    }),
-    {error, nokey}.
+webhook_payment(_) ->
+    {error, payload}.
+
+payment_status(Code) ->
+    case buckaroo_status(Code) of
+        undefined -> {error, unknown_status};
+        Status -> {ok, Status}
+    end.
 
 payment_link_contact(JSON) ->
-    Consumer = maps:get(<<"Consumer">>, JSON, #{}),
-    Customer = maps:get(<<"Customer">>, JSON, #{}),
-    Invoice = maps:get(<<"Invoice">>, JSON, #{}),
+    Consumer = first_map([maps:get(<<"Consumer">>, JSON, undefined)]),
+    Customer = first_map([maps:get(<<"Customer">>, JSON, undefined)]),
+    Invoice = first_map([maps:get(<<"Invoice">>, JSON, undefined)]),
     Address = first_map([
         maps:get(<<"BillingAddress">>, JSON, undefined),
         maps:get(<<"InvoiceAddress">>, JSON, undefined),
@@ -561,7 +561,7 @@ buckaroo_name_props(Name) when is_binary(Name) ->
 buckaroo_name_props(_) ->
     #{}.
 
-buckaroo_address_props(Address) when is_map(Address) ->
+buckaroo_address_props(Address) ->
     #{
         <<"address_street_1">> => first_defined([
             maps:get(<<"Street">>, Address, undefined),
@@ -585,9 +585,7 @@ buckaroo_address_props(Address) when is_map(Address) ->
             maps:get(<<"Country">>, Address, undefined),
             maps:get(<<"CountryCode">>, Address, undefined)
         ])
-    };
-buckaroo_address_props(_) ->
-    #{}.
+    }.
 
 first_map([Value | _Rest]) when is_map(Value) ->
     Value;
@@ -609,8 +607,6 @@ maybe_update_contact(_PaymentId, _BuckarooId, _Contact, _CurrentStatus, 0, _Cont
 maybe_update_contact(PaymentId, BuckarooId, Contact, new, StatusCode, Context) ->
     case buckaroo_status(StatusCode) of
         undefined ->
-            ok;
-        new ->
             ok;
         _Status ->
             maybe_update_contact_1(PaymentId, BuckarooId, Contact, Context)

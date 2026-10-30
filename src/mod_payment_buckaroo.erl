@@ -18,6 +18,36 @@
 %% limitations under the License.
 
 -module(mod_payment_buckaroo).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "site_administrator", "module",
+        "payments", "configuration", "api_and_integration"
+    ]
+}).
+-moduledoc("
+Provide Buckaroo checkout and verified payment pushes through `mod_payment`.
+
+Enable this module together with `mod_payment`. The checkout adapter accepts EUR.
+Select it with `#payment_request{preferred_psp_module = mod_payment_buckaroo}`.
+
+Configure these site settings under **System → Payment configuration**, requiring
+`use.mod_admin_config`:
+
+- `is_live`: select live checkout instead of test; defaults to false.
+- `website_key` and `secret_key`: Buckaroo API credentials.
+- `webhook_host`: optional externally reachable origin, including protocol.
+- `invoice_nr_prefix`: generated invoice prefix, defaulting to `INV`.
+- `services_excluded` and `services_selectable`: comma-separated service codes
+  controlling the methods offered by the checkout form.
+
+Verified JSON pushes arrive at `/buckaroo/webhook` or the payment-specific
+`/buckaroo/webhook/:payment_nr`. Signed browser returns use
+`/buckaroo/ready/:payment_nr`. Incoming debit payments may be imported when
+`mod_payment.accept_unknown_payments` is enabled; credit transactions are not
+imported as incoming payments. Known payments support status synchronization.
+This adapter does not implement discovery polling for unknown payments.
+").
+
 
 -mod_title("Payments using Buckaroo").
 -mod_description("Payments using Payment Service Provider Buckaroo").
@@ -38,6 +68,7 @@
     },
     #{
         key => secret_key,
+        is_secret => true,
         type => binary,
         default => <<>>,
         description => "Buckaroo secret API key."
