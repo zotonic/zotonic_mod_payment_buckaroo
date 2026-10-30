@@ -1,4 +1,5 @@
 [
+    {buckaroo_payment_webhook_generic, [ "buckaroo", "webhook" ], controller_buckaroo_webhook, []},
     {buckaroo_payment_webhook, [ "buckaroo", "webhook", payment_nr ], controller_buckaroo_webhook, []},
     {buckaroo_payment_redirect, [ "buckaroo", "ready", payment_nr ], controller_buckaroo_redirect, []}
 ].

@@ -38,6 +38,7 @@
     },
     #{
         key => secret_key,
+        is_secret => true,
         type => binary,
         default => <<>>,
         description => "Buckaroo secret API key."
