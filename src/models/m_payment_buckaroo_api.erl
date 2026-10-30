@@ -17,6 +17,31 @@
 %% limitations under the License.
 
 -module(m_payment_buckaroo_api).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "integrator", "model",
+        "payments", "api_and_integration"
+    ]
+}).
+-moduledoc("
+Create Buckaroo transactions and normalize their verified status updates.
+
+This is an Erlang API module without template model paths.
+`create(PaymentId, Context)` creates checkout for an existing local payment and
+returns `{ok, #payment_psp_handler{}}` or an error. Calls use the configured website
+and secret keys and the live/test environment selected by mod_payment_buckaroo.
+
+For example, `m_payment_buckaroo_api:transaction_status(TransactionId, Context)`
+returns `{ok, {StatusCode, DateTime}}` or `{error, Reason}`.
+`is_valid_authorization_header/2` verifies a push against its original request body;
+`webhook_data/2` processes decoded, verified push data. The controller performs
+verification before invoking that processing function.
+
+These functions are intended for trusted server callers and do not implement
+model-path ACL checks. Use the shared payment-request notification for application
+checkout and the shared receive policy for verified incoming payments.
+").
+
 
 %% Exported for the documented HTTP contract tests in test/.
 -export([api_call/5]).
@@ -536,7 +561,7 @@ buckaroo_name_props(Name) when is_binary(Name) ->
 buckaroo_name_props(_) ->
     #{}.
 
-buckaroo_address_props(Address) when is_map(Address) ->
+buckaroo_address_props(Address) ->
     #{
         <<"address_street_1">> => first_defined([
             maps:get(<<"Street">>, Address, undefined),
@@ -560,9 +585,7 @@ buckaroo_address_props(Address) when is_map(Address) ->
             maps:get(<<"Country">>, Address, undefined),
             maps:get(<<"CountryCode">>, Address, undefined)
         ])
-    };
-buckaroo_address_props(_) ->
-    #{}.
+    }.
 
 first_map([Value | _Rest]) when is_map(Value) ->
     Value;
@@ -584,8 +607,6 @@ maybe_update_contact(_PaymentId, _BuckarooId, _Contact, _CurrentStatus, 0, _Cont
 maybe_update_contact(PaymentId, BuckarooId, Contact, new, StatusCode, Context) ->
     case buckaroo_status(StatusCode) of
         undefined ->
-            ok;
-        new ->
             ok;
         _Status ->
             maybe_update_contact_1(PaymentId, BuckarooId, Contact, Context)
